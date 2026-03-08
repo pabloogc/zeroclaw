@@ -433,6 +433,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 wa.phone_number_id.clone().unwrap_or_default(),
                 wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
+                wa.account_id.clone(),
             ))
         });
 
@@ -1847,6 +1848,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         };
 
         let key = whatsapp_memory_key(&msg);

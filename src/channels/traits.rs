@@ -12,6 +12,8 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// When true, the agent processes the message for context/memory but does not send a reply.
+    pub silent: bool,
 }
 
 /// Message to send through a channel
@@ -172,6 +174,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                silent: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -188,6 +191,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            silent: false,
         };
 
         let cloned = message.clone();

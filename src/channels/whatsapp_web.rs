@@ -58,6 +58,8 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// Bot account ID for group mention filtering (e.g., "123213123")
+    account_id: Option<String>,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -81,12 +83,14 @@ impl WhatsAppWebChannel {
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        account_id: Option<String>,
     ) -> Self {
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            account_id,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -324,6 +328,7 @@ impl Channel for WhatsAppWebChannel {
         // Build the bot
         let tx_clone = tx.clone();
         let allowed_numbers = self.allowed_numbers.clone();
+        let account_id = self.account_id.clone();
 
         let mut builder = Bot::builder()
             .with_backend(backend)
@@ -332,6 +337,7 @@ impl Channel for WhatsAppWebChannel {
             .on_event(move |event, _client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
+                let account_id = account_id.clone();
                 async move {
                     match event {
                         Event::Message(msg, info) => {
@@ -376,6 +382,13 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
+                                // In group chats, process for context but only reply when mentioned.
+                                let is_group = chat.ends_with("@g.us");
+                                let silent = account_id.as_ref().is_some_and(|id| {
+                                    let mention = format!("@{}", id.trim_start_matches('@'));
+                                    is_group && !trimmed.contains(&mention)
+                                });
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -386,6 +399,7 @@ impl Channel for WhatsAppWebChannel {
                                         content: trimmed.to_string(),
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
+                                        silent,
                                     })
                                     .await
                                 {
@@ -618,6 +632,7 @@ mod tests {
             None,
             None,
             vec!["+1234567890".into()],
+            None,
         )
     }
 
@@ -639,7 +654,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
+        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()], None);
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -647,7 +662,7 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
+        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![], None);
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
