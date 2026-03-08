@@ -30,9 +30,13 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::select;
+
+#[cfg(feature = "whatsapp-web")]
+const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/gif"];
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -341,19 +345,10 @@ impl Channel for WhatsAppWebChannel {
                 async move {
                     match event {
                         Event::Message(msg, info) => {
-                            // Extract message content
-                            let text = msg.text_content().unwrap_or("");
                             let sender_jid = info.source.sender.clone();
                             let sender_alt = info.source.sender_alt.clone();
                             let sender = sender_jid.user().to_string();
                             let chat = info.source.chat.to_string();
-
-                            tracing::info!(
-                                "WhatsApp Web message from {} in {}: {}",
-                                sender,
-                                chat,
-                                text
-                            );
 
                             let mapped_phone = if sender_jid.is_lid() {
                                 _client.get_phone_number_from_lid(&sender_jid.user).await
@@ -366,51 +361,113 @@ impl Channel for WhatsAppWebChannel {
                                 mapped_phone.as_deref(),
                             );
 
-                            if let Some(normalized) = sender_candidates
+                            let Some(normalized) = sender_candidates
                                 .iter()
                                 .find(|candidate| {
                                     Self::is_number_allowed_for_list(&allowed_numbers, candidate)
                                 })
                                 .cloned()
-                            {
-                                let trimmed = text.trim();
-                                if trimmed.is_empty() {
-                                    tracing::debug!(
-                                        "WhatsApp Web: ignoring empty or non-text message from {}",
-                                        normalized
-                                    );
-                                    return;
-                                }
-
-                                // In group chats, process for context but only reply when mentioned.
-                                let is_group = chat.ends_with("@g.us");
-                                let silent = account_id.as_ref().is_some_and(|id| {
-                                    let mention = format!("@{}", id.trim_start_matches('@'));
-                                    is_group && !trimmed.contains(&mention)
-                                });
-
-                                if let Err(e) = tx_inner
-                                    .send(ChannelMessage {
-                                        id: uuid::Uuid::new_v4().to_string(),
-                                        channel: "whatsapp".to_string(),
-                                        sender: normalized.clone(),
-                                        // Reply to the originating chat JID (DM or group).
-                                        reply_target: chat,
-                                        content: trimmed.to_string(),
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
-                                        silent,
-                                    })
-                                    .await
-                                {
-                                    tracing::error!("Failed to send message to channel: {}", e);
-                                }
-                            } else {
+                            else {
                                 tracing::warn!(
                                     "WhatsApp Web: message from {} not in allowed list (candidates: {:?})",
                                     sender_jid,
                                     sender_candidates
                                 );
+                                return;
+                            };
+
+                            // Build content from text or image.
+                            let base_msg = msg.get_base_message();
+                            let content = if let Some(text) = msg.text_content() {
+                                let trimmed = text.trim();
+                                if trimmed.is_empty() {
+                                    tracing::debug!(
+                                        "WhatsApp Web: ignoring empty text message from {}",
+                                        normalized
+                                    );
+                                    return;
+                                }
+                                trimmed.to_string()
+                            } else if let Some(img_msg) = &base_msg.image_message {
+                                let mime_type = img_msg
+                                    .mimetype
+                                    .as_deref()
+                                    .unwrap_or("image/jpeg")
+                                    .split(';')
+                                    .next()
+                                    .unwrap_or("image/jpeg")
+                                    .trim()
+                                    .to_ascii_lowercase();
+
+                                if !ALLOWED_IMAGE_MIME_TYPES.contains(&mime_type.as_str()) {
+                                    tracing::debug!(
+                                        "WhatsApp Web: unsupported image MIME type '{}' from {}, skipping",
+                                        mime_type, normalized
+                                    );
+                                    return;
+                                }
+
+                                match _client.download(img_msg.as_ref()).await {
+                                    Ok(bytes) => {
+                                        let data_uri = format!(
+                                            "data:{mime_type};base64,{}",
+                                            STANDARD.encode(&bytes)
+                                        );
+                                        let caption = msg.get_caption().unwrap_or("").trim();
+                                        tracing::debug!(
+                                            "WhatsApp Web: image message from {} ({} bytes)",
+                                            normalized, bytes.len()
+                                        );
+                                        if caption.is_empty() {
+                                            format!("[IMAGE:{data_uri}]")
+                                        } else {
+                                            format!("{caption}\n\n[IMAGE:{data_uri}]")
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "WhatsApp Web: failed to download image from {}: {}",
+                                            normalized, e
+                                        );
+                                        return;
+                                    }
+                                }
+                            } else {
+                                tracing::debug!(
+                                    "WhatsApp Web: unsupported message type from {sender}, skipping"
+                                );
+                                return;
+                            };
+
+                            tracing::info!(
+                                "WhatsApp Web message from {} in {}: {}",
+                                sender,
+                                chat,
+                                &content[..content.len().min(80)]
+                            );
+
+                            // In group chats, process for context but only reply when mentioned.
+                            let is_group = chat.ends_with("@g.us");
+                            let silent = account_id.as_ref().is_some_and(|id| {
+                                let mention = format!("@{}", id.trim_start_matches('@'));
+                                is_group && !content.contains(&mention)
+                            });
+
+                            if let Err(e) = tx_inner
+                                .send(ChannelMessage {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    channel: "whatsapp".to_string(),
+                                    sender: normalized.clone(),
+                                    // Reply to the originating chat JID (DM or group).
+                                    reply_target: chat,
+                                    content,
+                                    timestamp: chrono::Utc::now().timestamp() as u64,
+                                    thread_ts: None,
+                                    silent,
+                                })
+                                .await
+                            {
+                                tracing::error!("Failed to send message to channel: {}", e);
                             }
                         }
                         Event::Connected(_) => {

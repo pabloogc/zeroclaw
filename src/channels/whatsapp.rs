@@ -1,6 +1,14 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use uuid::Uuid;
+
+const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "image/gif",
+];
 
 /// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
 ///
@@ -75,8 +83,73 @@ impl WhatsAppChannel {
         &self.verify_token
     }
 
+    /// Fetch a WhatsApp media object and return it as a base64 data URI.
+    ///
+    /// 1. GET `https://graph.facebook.com/v18.0/{media_id}` → `{ url, mime_type }`
+    /// 2. GET `{url}` (with Bearer auth) → raw image bytes
+    /// 3. Return `data:{mime_type};base64,{b64}`
+    async fn fetch_media_as_data_uri(&self, media_id: &str) -> Option<String> {
+        let meta_url = format!("https://graph.facebook.com/v18.0/{media_id}");
+        let meta_resp = self
+            .http_client()
+            .get(&meta_url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .ok()?;
+
+        if !meta_resp.status().is_success() {
+            tracing::warn!(
+                "WhatsApp: failed to fetch media metadata for {media_id}: {}",
+                meta_resp.status()
+            );
+            return None;
+        }
+
+        let meta: serde_json::Value = meta_resp.json().await.ok()?;
+        let url = meta.get("url").and_then(|u| u.as_str())?;
+        let mime_type = meta
+            .get("mime_type")
+            .and_then(|m| m.as_str())
+            .unwrap_or("image/jpeg")
+            .split(';')
+            .next()
+            .unwrap_or("image/jpeg")
+            .trim()
+            .to_ascii_lowercase();
+
+        if !ALLOWED_IMAGE_MIME_TYPES.contains(&mime_type.as_str()) {
+            tracing::debug!("WhatsApp: skipping unsupported media MIME type: {mime_type}");
+            return None;
+        }
+
+        if ensure_https(url).is_err() {
+            tracing::warn!("WhatsApp: media download URL is not HTTPS, skipping");
+            return None;
+        }
+
+        let image_resp = self
+            .http_client()
+            .get(url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .await
+            .ok()?;
+
+        if !image_resp.status().is_success() {
+            tracing::warn!(
+                "WhatsApp: failed to download media {media_id}: {}",
+                image_resp.status()
+            );
+            return None;
+        }
+
+        let bytes = image_resp.bytes().await.ok()?;
+        Some(format!("data:{mime_type};base64,{}", STANDARD.encode(&bytes)))
+    }
+
     /// Parse an incoming webhook payload from Meta and extract messages
-    pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+    pub async fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
         // WhatsApp Cloud API webhook structure:
@@ -122,16 +195,54 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Extract text content (support text messages only for now)
+                    // Extract message content (text or image).
+                    let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     let content = if let Some(text_obj) = msg.get("text") {
-                        text_obj
+                        let body = text_obj
                             .get("body")
                             .and_then(|b| b.as_str())
                             .unwrap_or("")
-                            .to_string()
+                            .to_string();
+                        if body.is_empty() {
+                            continue;
+                        }
+                        body
+                    } else if msg_type == "image" {
+                        let image_obj = msg.get("image");
+                        let media_id = image_obj
+                            .and_then(|i| i.get("id"))
+                            .and_then(|i| i.as_str());
+                        let caption = image_obj
+                            .and_then(|i| i.get("caption"))
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+
+                        let Some(id) = media_id else {
+                            tracing::debug!(
+                                "WhatsApp: image message from {from} has no media ID, skipping"
+                            );
+                            continue;
+                        };
+
+                        let Some(data_uri) = self.fetch_media_as_data_uri(id).await else {
+                            tracing::debug!(
+                                "WhatsApp: failed to fetch image {id} from {from}, skipping"
+                            );
+                            continue;
+                        };
+
+                        if caption.is_empty() {
+                            format!("[IMAGE:{data_uri}]")
+                        } else {
+                            format!("{caption}\n\n[IMAGE:{data_uri}]")
+                        }
                     } else {
-                        // Could be image, audio, etc. — skip for now
-                        tracing::debug!("WhatsApp: skipping non-text message from {from}");
+                        // audio, sticker, location, etc. — skip
+                        tracing::debug!(
+                            "WhatsApp: skipping unsupported message type '{msg_type}' from {from}"
+                        );
                         continue;
                     };
 
@@ -282,27 +393,27 @@ mod tests {
         )
     }
 
-    #[test]
-    fn whatsapp_channel_name() {
+    #[tokio::test]
+    async fn whatsapp_channel_name() {
         let ch = make_channel();
         assert_eq!(ch.name(), "whatsapp");
     }
 
-    #[test]
-    fn whatsapp_verify_token() {
+    #[tokio::test]
+    async fn whatsapp_verify_token() {
         let ch = make_channel();
         assert_eq!(ch.verify_token(), "verify-me");
     }
 
-    #[test]
-    fn whatsapp_number_allowed_exact() {
+    #[tokio::test]
+    async fn whatsapp_number_allowed_exact() {
         let ch = make_channel();
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(!ch.is_number_allowed("+9876543210"));
     }
 
-    #[test]
-    fn whatsapp_number_allowed_wildcard() {
+    #[tokio::test]
+    async fn whatsapp_number_allowed_wildcard() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -314,22 +425,22 @@ mod tests {
         assert!(ch.is_number_allowed("+9999999999"));
     }
 
-    #[test]
-    fn whatsapp_number_denied_empty() {
+    #[tokio::test]
+    async fn whatsapp_number_denied_empty() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![], None);
         assert!(!ch.is_number_allowed("+1234567890"));
     }
 
-    #[test]
-    fn whatsapp_parse_empty_payload() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_payload() {
         let ch = make_channel();
         let payload = serde_json::json!({});
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_valid_text_message() {
+    #[tokio::test]
+    async fn whatsapp_parse_valid_text_message() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "object": "whatsapp_business_account",
@@ -357,7 +468,7 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
@@ -365,8 +476,8 @@ mod tests {
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
     }
 
-    #[test]
-    fn whatsapp_parse_unauthorized_number() {
+    #[tokio::test]
+    async fn whatsapp_parse_unauthorized_number() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "object": "whatsapp_business_account",
@@ -384,12 +495,12 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Unauthorized numbers should be filtered");
     }
 
-    #[test]
-    fn whatsapp_parse_non_text_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_non_text_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -412,12 +523,12 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Non-text messages should be skipped");
     }
 
-    #[test]
-    fn whatsapp_parse_multiple_messages() {
+    #[tokio::test]
+    async fn whatsapp_parse_multiple_messages() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -438,14 +549,14 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "First");
         assert_eq!(msgs[1].content, "Second");
     }
 
-    #[test]
-    fn whatsapp_parse_normalizes_phone_with_plus() {
+    #[tokio::test]
+    async fn whatsapp_parse_normalizes_phone_with_plus() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -469,13 +580,13 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
     }
 
-    #[test]
-    fn whatsapp_empty_text_skipped() {
+    #[tokio::test]
+    async fn whatsapp_empty_text_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -498,7 +609,7 @@ mod tests {
             }]
         });
 
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
@@ -506,62 +617,62 @@ mod tests {
     // EDGE CASES — Comprehensive coverage
     // ══════════════════════════════════════════════════════════
 
-    #[test]
-    fn whatsapp_parse_missing_entry_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_entry_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "object": "whatsapp_business_account"
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_entry_not_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_entry_not_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": "not_an_array"
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_changes_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_changes_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{ "id": "123" }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_changes_not_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_changes_not_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": "not_an_array"
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_value() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_value() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{ "field": "messages" }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_messages_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_messages_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -572,12 +683,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_messages_not_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_messages_not_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -588,12 +699,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_missing_from_field() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_from_field() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -614,12 +725,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Messages without 'from' should be skipped");
     }
 
-    #[test]
-    fn whatsapp_parse_missing_text_body() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_text_body() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -641,15 +752,15 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(
             msgs.is_empty(),
             "Messages with empty text object should be skipped"
         );
     }
 
-    #[test]
-    fn whatsapp_parse_null_text_body() {
+    #[tokio::test]
+    async fn whatsapp_parse_null_text_body() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -671,12 +782,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Messages with null body should be skipped");
     }
 
-    #[test]
-    fn whatsapp_parse_invalid_timestamp_uses_current() {
+    #[tokio::test]
+    async fn whatsapp_parse_invalid_timestamp_uses_current() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -698,14 +809,14 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         // Timestamp should be current time (non-zero)
         assert!(msgs[0].timestamp > 0);
     }
 
-    #[test]
-    fn whatsapp_parse_missing_timestamp_uses_current() {
+    #[tokio::test]
+    async fn whatsapp_parse_missing_timestamp_uses_current() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -726,13 +837,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert!(msgs[0].timestamp > 0);
     }
 
-    #[test]
-    fn whatsapp_parse_multiple_entries() {
+    #[tokio::test]
+    async fn whatsapp_parse_multiple_entries() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -768,14 +879,14 @@ mod tests {
                 }
             ]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "Entry 1");
         assert_eq!(msgs[1].content, "Entry 2");
     }
 
-    #[test]
-    fn whatsapp_parse_multiple_changes() {
+    #[tokio::test]
+    async fn whatsapp_parse_multiple_changes() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -809,14 +920,14 @@ mod tests {
                 ]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "Change 1");
         assert_eq!(msgs[1].content, "Change 2");
     }
 
-    #[test]
-    fn whatsapp_parse_status_update_ignored() {
+    #[tokio::test]
+    async fn whatsapp_parse_status_update_ignored() {
         // Status updates have "statuses" instead of "messages"
         let ch = make_channel();
         let payload = serde_json::json!({
@@ -832,12 +943,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty(), "Status updates should be ignored");
     }
 
-    #[test]
-    fn whatsapp_parse_audio_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_audio_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -859,12 +970,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_video_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_video_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -886,12 +997,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_document_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_document_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -913,12 +1024,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_sticker_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_sticker_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -940,12 +1051,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_location_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_location_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -967,12 +1078,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_contacts_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_contacts_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -994,12 +1105,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_reaction_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_reaction_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1021,12 +1132,12 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_mixed_authorized_unauthorized() {
+    #[tokio::test]
+    async fn whatsapp_parse_mixed_authorized_unauthorized() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1047,14 +1158,14 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "Allowed");
         assert_eq!(msgs[1].content, "Also allowed");
     }
 
-    #[test]
-    fn whatsapp_parse_unicode_message() {
+    #[tokio::test]
+    async fn whatsapp_parse_unicode_message() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1076,13 +1187,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello 👋 世界 🌍 مرحبا");
     }
 
-    #[test]
-    fn whatsapp_parse_very_long_message() {
+    #[tokio::test]
+    async fn whatsapp_parse_very_long_message() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1105,13 +1216,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content.len(), 10_000);
     }
 
-    #[test]
-    fn whatsapp_parse_whitespace_only_message_skipped() {
+    #[tokio::test]
+    async fn whatsapp_parse_whitespace_only_message_skipped() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1133,14 +1244,14 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         // Whitespace-only is NOT empty, so it passes through
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "   ");
     }
 
-    #[test]
-    fn whatsapp_number_allowed_multiple_numbers() {
+    #[tokio::test]
+    async fn whatsapp_number_allowed_multiple_numbers() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1158,8 +1269,8 @@ mod tests {
         assert!(!ch.is_number_allowed("+4444444444"));
     }
 
-    #[test]
-    fn whatsapp_number_allowed_case_sensitive() {
+    #[tokio::test]
+    async fn whatsapp_number_allowed_case_sensitive() {
         // Phone numbers should be exact match
         let ch = WhatsAppChannel::new(
             "tok".into(),
@@ -1173,8 +1284,8 @@ mod tests {
         assert!(!ch.is_number_allowed("+1234567891"));
     }
 
-    #[test]
-    fn whatsapp_parse_phone_already_has_plus() {
+    #[tokio::test]
+    async fn whatsapp_parse_phone_already_has_plus() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1197,13 +1308,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
     }
 
-    #[test]
-    fn whatsapp_channel_fields_stored_correctly() {
+    #[tokio::test]
+    async fn whatsapp_channel_fields_stored_correctly() {
         let ch = WhatsAppChannel::new(
             "my-access-token".into(),
             "phone-id-123".into(),
@@ -1217,8 +1328,8 @@ mod tests {
         assert!(!ch.is_number_allowed("+333"));
     }
 
-    #[test]
-    fn whatsapp_parse_empty_messages_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_messages_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1229,34 +1340,34 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_empty_entry_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_entry_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": []
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_empty_changes_array() {
+    #[tokio::test]
+    async fn whatsapp_parse_empty_changes_array() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": []
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn whatsapp_parse_newlines_preserved() {
+    #[tokio::test]
+    async fn whatsapp_parse_newlines_preserved() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1278,13 +1389,13 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Line 1\nLine 2\nLine 3");
     }
 
-    #[test]
-    fn whatsapp_parse_special_characters() {
+    #[tokio::test]
+    async fn whatsapp_parse_special_characters() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1306,7 +1417,7 @@ mod tests {
                 }]
             }]
         });
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(
             msgs[0].content,
@@ -1336,8 +1447,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn whatsapp_group_message_with_mention_passes() {
+    #[tokio::test]
+    async fn whatsapp_group_message_with_mention_passes() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1346,14 +1457,14 @@ mod tests {
             Some("99887766".into()),
         );
         let payload = make_group_payload("111", "hey @99887766 do this", true);
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "[+111]: hey @99887766 do this");
         assert!(!msgs[0].silent);
     }
 
-    #[test]
-    fn whatsapp_group_message_without_mention_is_silent() {
+    #[tokio::test]
+    async fn whatsapp_group_message_without_mention_is_silent() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1362,7 +1473,7 @@ mod tests {
             Some("99887766".into()),
         );
         let payload = make_group_payload("111", "just chatting", true);
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1, "Group message should still be processed");
         assert!(
             msgs[0].silent,
@@ -1370,8 +1481,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn whatsapp_direct_message_passes_without_mention() {
+    #[tokio::test]
+    async fn whatsapp_direct_message_passes_without_mention() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1381,12 +1492,12 @@ mod tests {
         );
         // Direct message (no recipient_type: group) should pass without needing a mention
         let payload = make_group_payload("111", "hello bot", false);
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1, "Direct messages should always pass through");
     }
 
-    #[test]
-    fn whatsapp_group_message_with_mention_not_silent() {
+    #[tokio::test]
+    async fn whatsapp_group_message_with_mention_not_silent() {
         let ch = WhatsAppChannel::new(
             "tok".into(),
             "123".into(),
@@ -1395,7 +1506,7 @@ mod tests {
             Some("99887766".into()),
         );
         let payload = make_group_payload("111", "hey @99887766 help", true);
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert!(
             !msgs[0].silent,
@@ -1403,8 +1514,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn whatsapp_group_filter_inactive_without_account_id() {
+    #[tokio::test]
+    async fn whatsapp_group_filter_inactive_without_account_id() {
         // When account_id is not configured, all messages are processed with replies
         let ch = WhatsAppChannel::new(
             "tok".into(),
@@ -1414,7 +1525,7 @@ mod tests {
             None,
         );
         let payload = make_group_payload("111", "just chatting", true);
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(
             msgs.len(),
             1,
@@ -1426,8 +1537,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn whatsapp_mention_check_strips_leading_at() {
+    #[tokio::test]
+    async fn whatsapp_mention_check_strips_leading_at() {
         // account_id configured with or without leading @ should both work
         let ch = WhatsAppChannel::new(
             "tok".into(),
@@ -1437,7 +1548,26 @@ mod tests {
             Some("@99887766".into()),
         );
         let payload = make_group_payload("111", "hey @99887766 help", true);
-        let msgs = ch.parse_webhook_payload(&payload);
+        let msgs = ch.parse_webhook_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn whatsapp_image_message_no_media_id_skipped() {
+        let ch = WhatsAppChannel::new(
+            "tok".into(), "123".into(), "ver".into(), vec!["*".into()], None,
+        );
+        let payload = serde_json::json!({
+            "entry": [{ "changes": [{ "value": {
+                "messages": [{
+                    "from": "111",
+                    "timestamp": "1",
+                    "type": "image",
+                    "image": {}
+                }]
+            }}]}]
+        });
+        let msgs = ch.parse_webhook_payload(&payload).await;
+        assert!(msgs.is_empty(), "Image message without media ID should be skipped");
     }
 }
