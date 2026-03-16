@@ -458,8 +458,161 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
     })
 }
 
+/// Parse YAML-style frontmatter delimited by `---` lines.
+///
+/// Supports:
+/// - Plain scalars:        `key: value`
+/// - Quoted scalars:       `key: "value"` / `key: 'value'`
+/// - Literal block (`|`):  newlines preserved, leading indent stripped
+/// - Folded block (`>`):   newlines replaced with spaces
+///
+/// Chomping modifiers (`|-`, `|+`, `>-`, `>+`) are respected.
+fn parse_frontmatter(content: &str) -> Option<HashMap<String, String>> {
+    let rest = content.strip_prefix("---")?;
+    let rest = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n"))?;
+    let close = rest.find("\n---")?;
+    let frontmatter = &rest[..close];
+
+    let mut map = HashMap::new();
+    let mut lines = frontmatter.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        // Only process top-level keys (no leading whitespace).
+        if line.starts_with(' ') || line.starts_with('\t') {
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = raw_key.trim().to_string();
+        let value = raw_value.trim();
+
+        let parsed = match value {
+            // Literal block scalar (| / |- / |+)
+            v if v == "|" || v == "|-" || v == "|+" => {
+                let lines_vec = collect_block_scalar_lines(&mut lines);
+                apply_chomping(&lines_vec.join("\n"), v)
+            }
+            // Folded block scalar (> / >- / >+)
+            v if v == ">" || v == ">-" || v == ">+" => {
+                let lines_vec = collect_block_scalar_lines(&mut lines);
+                let folded = fold_block_scalar(&lines_vec);
+                apply_chomping(&folded, v)
+            }
+            // Quoted scalar
+            v if v.len() >= 2
+                && ((v.starts_with('"') && v.ends_with('"'))
+                    || (v.starts_with('\'') && v.ends_with('\''))) =>
+            {
+                v[1..v.len() - 1].to_string()
+            }
+            // Plain scalar
+            v => v.to_string(),
+        };
+
+        map.insert(key, parsed);
+    }
+    Some(map)
+}
+
+/// Collect the indented lines that form a block scalar body.
+/// Stops at the first line whose indentation is less than the block's indent level
+/// (determined by the first non-empty line).
+fn collect_block_scalar_lines<'a>(
+    lines: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+) -> Vec<String> {
+    let mut block: Vec<String> = Vec::new();
+    let mut indent: Option<usize> = None;
+
+    loop {
+        let Some(&next) = lines.peek() else { break };
+        let leading = next.len() - next.trim_start_matches(' ').len();
+
+        if next.trim().is_empty() {
+            // Empty lines are always part of the block.
+            block.push(String::new());
+            lines.next();
+            continue;
+        }
+
+        if indent.is_none() {
+            // First non-empty line sets the indentation level.
+            indent = Some(leading);
+        }
+
+        if leading < indent.unwrap_or(1) {
+            // Back to the parent level — block ends.
+            break;
+        }
+
+        lines.next();
+        let stripped = &next[indent.unwrap_or(0).min(next.len())..];
+        block.push(stripped.to_string());
+    }
+
+    block
+}
+
+/// Join folded block scalar lines: newlines become spaces, blank lines become newlines.
+fn fold_block_scalar(lines: &[String]) -> String {
+    let mut out = String::new();
+    for line in lines {
+        if line.is_empty() {
+            out.push('\n');
+        } else {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push(' ');
+            }
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Apply YAML chomping to a block scalar string.
+/// `|-` / `>-` → strip all trailing newlines.
+/// `|+` / `>+` → keep all trailing newlines as-is.
+/// `|`  / `>`  → clip: exactly one trailing newline.
+fn apply_chomping(s: &str, indicator: &str) -> String {
+    let chomp = indicator.chars().nth(1);
+    match chomp {
+        Some('-') => s.trim_end_matches('\n').to_string(),
+        Some('+') => s.to_string(),
+        _ => {
+            // Clip: one trailing newline.
+            let trimmed = s.trim_end_matches('\n');
+            format!("{trimmed}\n")
+        }
+    }
+}
+
+/// Return the body of a markdown file with the frontmatter block stripped.
+fn body_after_frontmatter(content: &str) -> &str {
+    if !content.starts_with("---") {
+        return content;
+    }
+    let rest = match content[3..].strip_prefix('\n').or_else(|| content[3..].strip_prefix("\r\n")) {
+        Some(r) => r,
+        None => return content,
+    };
+    let Some(pos) = rest.find("\n---") else {
+        return content;
+    };
+    let after = &rest[pos + 4..]; // skip "\n---"
+    after.strip_prefix('\n').or_else(|| after.strip_prefix("\r\n")).unwrap_or(after)
+}
+
 fn extract_description(content: &str) -> String {
-    content
+    // Prefer the `description` field from YAML frontmatter when present.
+    if let Some(fm) = parse_frontmatter(content) {
+        if let Some(desc) = fm.get("description") {
+            if !desc.is_empty() {
+                return desc.clone();
+            }
+        }
+    }
+    // Fall back: first non-header, non-empty line in the body (after any frontmatter).
+    body_after_frontmatter(content)
         .lines()
         .find(|line| !line.starts_with('#') && !line.trim().is_empty())
         .unwrap_or("No description")
@@ -1281,6 +1434,96 @@ description = "Bare minimum"
         let skills = load_skills(dir.path());
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "No description");
+    }
+
+    #[test]
+    fn md_skill_frontmatter_description_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("fm-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        let content = "---\nname: fm-skill\ndescription: \"Does cool things. Use when: (1) foo, (2) bar.\"\n---\n\n# FM Skill\n\nBody text here.\n";
+        fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(
+            skills[0].description,
+            "Does cool things. Use when: (1) foo, (2) bar."
+        );
+    }
+
+    #[test]
+    fn md_skill_frontmatter_without_description_falls_back_to_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("no-desc-fm");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        let content = "---\nname: no-desc-fm\n---\n\n# Title\n\nFallback description.\n";
+        fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].description, "Fallback description.");
+    }
+
+    #[test]
+    fn extract_description_uses_frontmatter_over_body() {
+        let content = "---\ndescription: From frontmatter\n---\n\n# Title\n\nFrom body.\n";
+        assert_eq!(extract_description(content), "From frontmatter");
+    }
+
+    #[test]
+    fn extract_description_no_frontmatter_uses_first_body_line() {
+        let content = "# Title\n\nFrom body.\n";
+        assert_eq!(extract_description(content), "From body.");
+    }
+
+    #[test]
+    fn extract_description_frontmatter_dashes_not_returned_as_description() {
+        // Without frontmatter support the old code would return "---" as the description.
+        let content = "---\nname: x\n---\n\n# Title\n";
+        let desc = extract_description(content);
+        assert_ne!(desc, "---");
+        assert_eq!(desc, "No description");
+    }
+
+    #[test]
+    fn parse_frontmatter_literal_block_scalar() {
+        let content = "---\ndescription: |\n  First line.\n  Second line.\n---\n";
+        let fm = parse_frontmatter(content).unwrap();
+        assert_eq!(fm["description"], "First line.\nSecond line.\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_literal_block_strip() {
+        let content = "---\ndescription: |-\n  First line.\n  Second line.\n---\n";
+        let fm = parse_frontmatter(content).unwrap();
+        assert_eq!(fm["description"], "First line.\nSecond line.");
+    }
+
+    #[test]
+    fn parse_frontmatter_folded_block_scalar() {
+        let content = "---\ndescription: >\n  First line.\n  Second line.\n---\n";
+        let fm = parse_frontmatter(content).unwrap();
+        // Folded: newlines become spaces, clip chomping adds one trailing newline.
+        assert_eq!(fm["description"], "First line. Second line.\n");
+    }
+
+    #[test]
+    fn parse_frontmatter_literal_block_with_blank_lines() {
+        let content = "---\ndescription: |\n  Para one.\n\n  Para two.\n---\n";
+        let fm = parse_frontmatter(content).unwrap();
+        assert_eq!(fm["description"], "Para one.\n\nPara two.\n");
+    }
+
+    #[test]
+    fn extract_description_multiline_frontmatter() {
+        let content =
+            "---\nname: my-skill\ndescription: |\n  Does A.\n  Does B.\n---\n\n# Title\n";
+        assert_eq!(extract_description(content), "Does A.\nDoes B.\n");
     }
 
     #[test]
