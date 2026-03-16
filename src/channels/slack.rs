@@ -2114,6 +2114,179 @@ impl SlackChannel {
             .collect()
     }
 
+    /// Convert standard Markdown to Slack's mrkdwn dialect.
+    ///
+    /// Key differences handled:
+    /// - `**bold**` → `*bold*`
+    /// - `*italic*` → `_italic_`
+    /// - `~~strike~~` → `~strike~`
+    /// - `[text](url)` → `<url|text>`
+    /// - ATX headers (`# H1`, `## H2`, …) → `*H1*`
+    /// - Inline code and fenced code blocks are preserved unchanged.
+    fn markdown_to_mrkdwn(text: &str) -> String {
+        let mut output = String::with_capacity(text.len());
+        let mut in_code_block = false;
+        for line in text.lines() {
+            if line.trim_start().starts_with("```") {
+                in_code_block = !in_code_block;
+                output.push_str(line);
+                output.push('\n');
+                continue;
+            }
+            if in_code_block {
+                output.push_str(line);
+                output.push('\n');
+                continue;
+            }
+            if let Some(content) = Self::strip_atx_header(&line) {
+                output.push('*');
+                output.push_str(&Self::convert_inline_md(content));
+                output.push('*');
+            } else {
+                output.push_str(&Self::convert_inline_md(&line));
+            }
+            output.push('\n');
+        }
+        if !text.ends_with('\n') && output.ends_with('\n') {
+            output.pop();
+        }
+        output
+    }
+
+    fn strip_atx_header(line: &str) -> Option<&str> {
+        let rest = line
+            .strip_prefix("######")
+            .or_else(|| line.strip_prefix("#####"))
+            .or_else(|| line.strip_prefix("####"))
+            .or_else(|| line.strip_prefix("###"))
+            .or_else(|| line.strip_prefix("##"))
+            .or_else(|| line.strip_prefix('#'))?;
+        if rest.starts_with(' ') || rest.is_empty() {
+            Some(rest.trim())
+        } else {
+            None
+        }
+    }
+
+    fn convert_inline_md(text: &str) -> String {
+        let mut output = String::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = 0;
+        while i < len {
+            match bytes[i] {
+                // Inline code: preserve as-is
+                b'`' => {
+                    if let Some(close) = text[i + 1..].find('`') {
+                        let end = i + 1 + close;
+                        output.push_str(&text[i..=end]);
+                        i = end + 1;
+                    } else {
+                        output.push_str(&text[i..]);
+                        break;
+                    }
+                }
+                // Bold: **text** → *text*
+                b'*' if i + 1 < len && bytes[i + 1] == b'*' => {
+                    if let Some(close_pos) = Self::find_closing_marker(&text[i + 2..], "**") {
+                        let inner = &text[i + 2..i + 2 + close_pos];
+                        output.push('*');
+                        output.push_str(&Self::convert_inline_md(inner));
+                        output.push('*');
+                        i += 2 + close_pos + 2;
+                    } else {
+                        output.push_str("**");
+                        i += 2;
+                    }
+                }
+                // Italic: *text* → _text_
+                b'*' => {
+                    if let Some(close_pos) = Self::find_closing_marker(&text[i + 1..], "*") {
+                        let inner = &text[i + 1..i + 1 + close_pos];
+                        output.push('_');
+                        output.push_str(&Self::convert_inline_md(inner));
+                        output.push('_');
+                        i += 1 + close_pos + 1;
+                    } else {
+                        output.push('*');
+                        i += 1;
+                    }
+                }
+                // Strikethrough: ~~text~~ → ~text~
+                b'~' if i + 1 < len && bytes[i + 1] == b'~' => {
+                    if let Some(close_pos) = Self::find_closing_marker(&text[i + 2..], "~~") {
+                        let inner = &text[i + 2..i + 2 + close_pos];
+                        output.push('~');
+                        output.push_str(&Self::convert_inline_md(inner));
+                        output.push('~');
+                        i += 2 + close_pos + 2;
+                    } else {
+                        output.push_str("~~");
+                        i += 2;
+                    }
+                }
+                // Links: [text](url) → <url|text>
+                b'[' => {
+                    if let Some((link_text, url, end)) = Self::parse_md_link(text, i) {
+                        output.push('<');
+                        output.push_str(&url);
+                        output.push('|');
+                        output.push_str(&link_text);
+                        output.push('>');
+                        i = end;
+                    } else {
+                        output.push('[');
+                        i += 1;
+                    }
+                }
+                _ => {
+                    let ch = text[i..].chars().next().unwrap();
+                    output.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        output
+    }
+
+    /// Find the byte position of `marker` in `text`, requiring at least one char of content
+    /// before it to avoid empty spans like `****`.
+    fn find_closing_marker(text: &str, marker: &str) -> Option<usize> {
+        let skip = text.chars().next()?.len_utf8();
+        text[skip..].find(marker).map(|pos| pos + skip)
+    }
+
+    /// Parse a Markdown link `[text](url)` at byte `start` in `text`.
+    /// Returns `(link_text, url, end_byte_index)` on success.
+    fn parse_md_link(text: &str, start: usize) -> Option<(String, String, usize)> {
+        let bytes = text.as_bytes();
+        let len = bytes.len();
+        let mut i = start + 1;
+        let mut depth = 1u32;
+        while i < len && depth > 0 {
+            match bytes[i] {
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                _ => {}
+            }
+            if depth > 0 {
+                i += 1;
+            }
+        }
+        if depth != 0 || i + 1 >= len || bytes[i + 1] != b'(' {
+            return None;
+        }
+        let text_end = i;
+        let url_start = i + 2;
+        let url_end = text[url_start..].find(')')? + url_start;
+        let link_text = text[start + 1..text_end].to_string();
+        let url = text[url_start..url_end].trim().to_string();
+        if url.is_empty() {
+            return None;
+        }
+        Some((link_text, url, url_end + 1))
+    }
+
     /// Evict expired or excess threads from the active-thread tracker.
     /// Each value is `(channel_id, last_seen_reply_ts, last_activity)`.
     fn evict_stale_threads(
@@ -2144,9 +2317,10 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let mrkdwn_content = Self::markdown_to_mrkdwn(&message.content);
         let mut body = serde_json::json!({
             "channel": message.recipient,
-            "text": message.content
+            "text": mrkdwn_content
         });
 
         if let Some(ref ts) = message.thread_ts {
@@ -3230,5 +3404,63 @@ mod tests {
         });
         let thread_ts = SlackChannel::inbound_thread_ts(&reply, "200.000");
         assert_eq!(thread_ts.as_deref(), Some("100.000"));
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_bold() {
+        assert_eq!(SlackChannel::markdown_to_mrkdwn("**hello**"), "*hello*");
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_italic() {
+        assert_eq!(SlackChannel::markdown_to_mrkdwn("*hello*"), "_hello_");
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_strikethrough() {
+        assert_eq!(SlackChannel::markdown_to_mrkdwn("~~hello~~"), "~hello~");
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_link() {
+        assert_eq!(
+            SlackChannel::markdown_to_mrkdwn("[click here](https://example.com)"),
+            "<https://example.com|click here>"
+        );
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_headers() {
+        assert_eq!(SlackChannel::markdown_to_mrkdwn("# Title"), "*Title*");
+        assert_eq!(SlackChannel::markdown_to_mrkdwn("## Sub"), "*Sub*");
+        assert_eq!(SlackChannel::markdown_to_mrkdwn("### Deep"), "*Deep*");
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_code_block_preserved() {
+        let input = "```rust\nlet x = **not bold**;\n```";
+        let output = SlackChannel::markdown_to_mrkdwn(input);
+        assert!(
+            output.contains("**not bold**"),
+            "code blocks should not be converted: {output}"
+        );
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_inline_code_preserved() {
+        assert_eq!(
+            SlackChannel::markdown_to_mrkdwn("`**not bold**`"),
+            "`**not bold**`"
+        );
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_mixed() {
+        let input = "# Heading\n**bold** and *italic* and ~~strike~~ and [link](https://x.com)";
+        let output = SlackChannel::markdown_to_mrkdwn(input);
+        assert_eq!(
+            output,
+            "*Heading*\n*bold* and _italic_ and ~strike~ and <https://x.com|link>"
+        );
     }
 }
