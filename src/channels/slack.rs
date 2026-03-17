@@ -400,6 +400,14 @@ impl SlackChannel {
         }
     }
 
+    fn append_sender_to_content(content: String, sender: &str) -> String {
+        let sender = sender.trim();
+        if sender.is_empty() {
+            return content;
+        }
+        format!("[{sender}] {content}")
+    }
+
     async fn build_incoming_content(
         &self,
         message: &serde_json::Value,
@@ -1764,12 +1772,13 @@ impl SlackChannel {
 
                 last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
                 let sender = self.resolve_sender_identity(user).await;
+                let content = Self::append_sender_to_content(normalized_text, &sender);
 
                 let channel_msg = ChannelMessage {
                     id: format!("slack_{channel_id}_{ts}"),
                     sender,
                     reply_target: channel_id.clone(),
-                    content: normalized_text,
+                    content,
                     channel: "slack".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -2593,12 +2602,13 @@ impl Channel for SlackChannel {
 
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
                         let sender = self.resolve_sender_identity(user).await;
+                        let content = Self::append_sender_to_content(normalized_text, &sender);
 
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender,
                             reply_target: channel_id.clone(),
-                            content: normalized_text,
+                            content,
                             channel: "slack".to_string(),
                             timestamp: std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -2677,12 +2687,13 @@ impl Channel for SlackChannel {
                     }
 
                     let sender = self.resolve_sender_identity(user).await;
+                    let content = Self::append_sender_to_content(normalized_text, &sender);
 
                     let channel_msg = ChannelMessage {
                         id: format!("slack_{thread_channel_id}_{reply_ts}"),
                         sender,
                         reply_target: thread_channel_id.clone(),
-                        content: normalized_text,
+                        content,
                         channel: "slack".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -2972,6 +2983,21 @@ mod tests {
             composed.as_deref(),
             Some("[IMAGE:data:image/png;base64,aaaa]")
         );
+    }
+
+    #[test]
+    fn append_sender_to_content_adds_sender_line() {
+        let content = SlackChannel::append_sender_to_content(
+            "hello world".to_string(),
+            "Display Name",
+        );
+        assert_eq!(content, "hello world\n\nFrom: Display Name");
+    }
+
+    #[test]
+    fn append_sender_to_content_ignores_empty_sender() {
+        let content = SlackChannel::append_sender_to_content("hello world".to_string(), "   ");
+        assert_eq!(content, "hello world");
     }
 
     #[test]
