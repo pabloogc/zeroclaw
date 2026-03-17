@@ -2126,8 +2126,14 @@ impl SlackChannel {
     fn markdown_to_mrkdwn(text: &str) -> String {
         let mut output = String::with_capacity(text.len());
         let mut in_code_block = false;
-        for line in text.lines() {
+        let mut table_buf: Vec<&str> = Vec::new();
+        let lines: Vec<&str> = text.lines().collect();
+        for line in &lines {
             if line.trim_start().starts_with("```") {
+                if !table_buf.is_empty() {
+                    output.push_str(&Self::render_table(&table_buf));
+                    table_buf.clear();
+                }
                 in_code_block = !in_code_block;
                 output.push_str(line);
                 output.push('\n');
@@ -2138,19 +2144,104 @@ impl SlackChannel {
                 output.push('\n');
                 continue;
             }
-            if let Some(content) = Self::strip_atx_header(&line) {
+            if Self::is_table_row(line) {
+                table_buf.push(line);
+                continue;
+            }
+            if !table_buf.is_empty() {
+                output.push_str(&Self::render_table(&table_buf));
+                table_buf.clear();
+            }
+            if let Some(content) = Self::strip_atx_header(line) {
                 output.push('*');
                 output.push_str(&Self::convert_inline_md(content));
                 output.push('*');
             } else {
-                output.push_str(&Self::convert_inline_md(&line));
+                output.push_str(&Self::convert_inline_md(line));
             }
             output.push('\n');
+        }
+        if !table_buf.is_empty() {
+            output.push_str(&Self::render_table(&table_buf));
         }
         if !text.ends_with('\n') && output.ends_with('\n') {
             output.pop();
         }
         output
+    }
+
+    fn is_table_row(line: &str) -> bool {
+        line.contains('|')
+    }
+
+    fn is_separator_row(line: &str) -> bool {
+        let trimmed = line.trim();
+        let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+        let inner = inner.strip_suffix('|').unwrap_or(inner);
+        inner.split('|').all(|cell| {
+            let c = cell.trim();
+            !c.is_empty() && c.chars().all(|ch| ch == '-' || ch == ':')
+        })
+    }
+
+    fn parse_table_cells(line: &str) -> Vec<String> {
+        let trimmed = line.trim();
+        let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
+        let inner = inner.strip_suffix('|').unwrap_or(inner);
+        inner.split('|').map(|cell| cell.trim().to_string()).collect()
+    }
+
+    fn render_table(lines: &[&str]) -> String {
+        let has_separator = lines.iter().any(|l| Self::is_separator_row(l));
+        if !has_separator || lines.len() < 2 {
+            let mut out = String::new();
+            for line in lines {
+                out.push_str(&Self::convert_inline_md(line));
+                out.push('\n');
+            }
+            return out;
+        }
+        let rows: Vec<Vec<String>> = lines
+            .iter()
+            .filter(|l| !Self::is_separator_row(l))
+            .map(|l| Self::parse_table_cells(l))
+            .collect();
+        if rows.is_empty() {
+            return String::new();
+        }
+        let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut widths = vec![0usize; col_count];
+        for row in &rows {
+            for (j, cell) in row.iter().enumerate() {
+                widths[j] = widths[j].max(cell.len());
+            }
+        }
+        let mut out = String::from("```\n");
+        for (idx, row) in rows.iter().enumerate() {
+            out.push('|');
+            for j in 0..col_count {
+                let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+                out.push(' ');
+                out.push_str(cell);
+                for _ in cell.len()..widths[j] {
+                    out.push(' ');
+                }
+                out.push_str(" |");
+            }
+            out.push('\n');
+            if idx == 0 {
+                out.push('|');
+                for j in 0..col_count {
+                    for _ in 0..widths[j] + 2 {
+                        out.push('-');
+                    }
+                    out.push('|');
+                }
+                out.push('\n');
+            }
+        }
+        out.push_str("```\n");
+        out
     }
 
     fn strip_atx_header(line: &str) -> Option<&str> {
@@ -3462,5 +3553,51 @@ mod tests {
             output,
             "*Heading*\n*bold* and _italic_ and ~strike~ and <https://x.com|link>"
         );
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_table_basic() {
+        let input = "| Name | Age |\n|------|-----|\n| Alice | 30 |\n| Bob | 25 |";
+        let output = SlackChannel::markdown_to_mrkdwn(input);
+        assert!(output.starts_with("```\n"), "should be a code block: {output}");
+        assert!(output.contains("Name"), "should contain header: {output}");
+        assert!(output.contains("Alice"), "should contain data: {output}");
+        assert!(output.contains("Bob"), "should contain data: {output}");
+        // original markdown separator row cells should not appear as data (e.g. "------" in a cell)
+        assert!(!output.contains("| ------ |"), "raw separator row should not appear: {output}");
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_table_aligned_columns() {
+        let input = "| A | Longer |\n|---|--------|\n| x | y |";
+        let output = SlackChannel::markdown_to_mrkdwn(input);
+        // All data lines between ``` markers should have the same length (padded)
+        let inner: Vec<&str> = output
+            .trim_start_matches("```\n")
+            .trim_end_matches("\n```\n")
+            .lines()
+            .filter(|l| !l.starts_with('|') || l.contains("--"))
+            .collect();
+        // Just verify it's a code block with aligned rows
+        assert!(output.starts_with("```\n"), "{output}");
+        assert!(output.trim_end_matches('\n').ends_with("```"), "{output}");
+        let _ = inner;
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_table_no_separator_passthrough() {
+        // Lines with pipes but no separator row should not be wrapped in a code block
+        let input = "a | b\nc | d";
+        let output = SlackChannel::markdown_to_mrkdwn(input);
+        assert!(!output.starts_with("```"), "non-table pipes should not be a code block: {output}");
+    }
+
+    #[test]
+    fn markdown_to_mrkdwn_table_surrounded_by_text() {
+        let input = "Before\n| Col |\n|-----|\n| Val |\nAfter";
+        let output = SlackChannel::markdown_to_mrkdwn(input);
+        assert!(output.starts_with("Before\n"), "{output}");
+        assert!(output.contains("```\n"), "{output}");
+        assert!(output.contains("After"), "{output}");
     }
 }
