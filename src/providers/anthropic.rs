@@ -547,6 +547,8 @@ impl Provider for AnthropicProvider {
             temperature,
         };
 
+        let request_json = serde_json::to_string(&request).unwrap_or_default();
+
         let mut request = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
@@ -559,6 +561,9 @@ impl Provider for AnthropicProvider {
         let response = request.send().await?;
 
         if !response.status().is_success() {
+            if response.status().as_u16() == 422 {
+                tracing::warn!(request_body = %request_json, "422 Unprocessable Entity — dumping request body");
+            }
             return Err(super::api_error("Anthropic", response).await);
         }
 
@@ -594,6 +599,8 @@ impl Provider for AnthropicProvider {
             tools: Self::convert_tools(request.tools),
         };
 
+        let request_json = serde_json::to_string(&native_request).unwrap_or_default();
+
         let req = self
             .http_client()
             .post(format!("{}/v1/messages", self.base_url))
@@ -603,6 +610,9 @@ impl Provider for AnthropicProvider {
 
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
+            if response.status().as_u16() == 422 {
+                tracing::warn!(request_body = %request_json, "422 Unprocessable Entity — dumping request body");
+            }
             return Err(super::api_error("Anthropic", response).await);
         }
 
