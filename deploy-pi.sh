@@ -75,6 +75,6 @@ ssh "$PI_HOST" "$PI_PATH --version"
 echo "Done. $BINARY deployed to $PI_HOST:$PI_PATH"
 
 echo "Restarting zeroclaw service on Raspberry Pi..."
-ssh "$PI_HOST" "sudo systemctl restart zeroclaw"
+ssh "$PI_HOST" "zeroclaw service stop; zeroclaw service start"
 
-echo "Deployment complete. Check service status with: ssh $PI_HOST 'sudo systemctl status zeroclaw'"
+echo "Deployment complete. Check service status with: zeroclaw service status"
