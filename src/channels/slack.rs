@@ -29,8 +29,10 @@ pub struct SlackChannel {
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
+    last_draft_edit: Mutex<HashMap<String, Instant>>,
 }
 
+const SLACK_DRAFT_UPDATE_INTERVAL_MS: u64 = 500;
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
 const SLACK_HISTORY_DEFAULT_RETRY_AFTER_SECS: u64 = 1;
 const SLACK_HISTORY_MAX_BACKOFF_SECS: u64 = 120;
@@ -79,6 +81,7 @@ impl SlackChannel {
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
+            last_draft_edit: Mutex::new(HashMap::new()),
         }
     }
 
@@ -405,7 +408,7 @@ impl SlackChannel {
         if sender.is_empty() {
             return content;
         }
-        format!("[{sender}] {content}")
+        format!("[From: {sender}] {content}")
     }
 
     async fn build_incoming_content(
@@ -2416,6 +2419,146 @@ impl Channel for SlackChannel {
         "slack"
     }
 
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let mut body = serde_json::json!({
+            "channel": message.recipient,
+            "text": "…"
+        });
+        if let Some(ref ts) = message.thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+        let resp_json: serde_json::Value = resp.json().await?;
+        if resp_json.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = resp_json
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack send_draft failed: {err}");
+        }
+        let ts = resp_json
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        if let Some(ref ts) = ts {
+            self.last_draft_edit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(message.recipient.clone(), Instant::now());
+            tracing::debug!("Slack send_draft posted ts={ts}");
+        }
+        Ok(ts)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit mid-stream edits to avoid Slack Tier-3 throttling
+        {
+            let cache = self
+                .last_draft_edit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(last) = cache.get(recipient) {
+                let elapsed = u64::try_from(last.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed < SLACK_DRAFT_UPDATE_INTERVAL_MS {
+                    return Ok(());
+                }
+            }
+        }
+        let body = serde_json::json!({
+            "channel": recipient,
+            "ts": message_id,
+            "text": Self::markdown_to_mrkdwn(text),
+        });
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            self.last_draft_edit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(recipient.to_string(), Instant::now());
+        } else {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Slack chat.update failed ({status}): {err}");
+        }
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.last_draft_edit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(recipient);
+        let body = serde_json::json!({
+            "channel": recipient,
+            "ts": message_id,
+            "text": Self::markdown_to_mrkdwn(text),
+        });
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+        if resp.status().is_success() {
+            return Ok(());
+        }
+        let status = resp.status();
+        let err = resp.text().await.unwrap_or_default();
+        tracing::warn!("Slack finalize_draft chat.update failed ({status}): {err}; falling back to new message");
+        self.send(&SendMessage::new(text, recipient)).await
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.last_draft_edit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(recipient);
+        let body = serde_json::json!({
+            "channel": recipient,
+            "ts": message_id,
+        });
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.delete")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let err = resp.text().await.unwrap_or_default();
+            tracing::debug!("Slack chat.delete failed ({status}): {err}");
+        }
+        Ok(())
+    }
+
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let mrkdwn_content = Self::markdown_to_mrkdwn(&message.content);
         let mut body = serde_json::json!({
@@ -2991,7 +3134,7 @@ mod tests {
             "hello world".to_string(),
             "Display Name",
         );
-        assert_eq!(content, "hello world\n\nFrom: Display Name");
+        assert_eq!(content, "[From: Display Name] hello world");
     }
 
     #[test]
@@ -3579,6 +3722,18 @@ mod tests {
             output,
             "*Heading*\n*bold* and _italic_ and ~strike~ and <https://x.com|link>"
         );
+    }
+
+    #[test]
+    fn supports_draft_updates_is_true() {
+        let ch = SlackChannel::new(
+            "xoxb-test".to_string(),
+            None,
+            None,
+            vec![],
+            vec!["*".to_string()],
+        );
+        assert!(ch.supports_draft_updates());
     }
 
     #[test]

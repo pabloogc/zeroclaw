@@ -1932,6 +1932,9 @@ async fn process_channel_message(
     } else {
         (None, None)
     };
+    // Clone before delta_tx is moved into run_tool_call_loop so notify_task can
+    // pipe tool-call notifications into the same draft instead of sending new messages.
+    let notify_delta_tx = delta_tx.as_ref().map(|tx| tx.clone());
 
     let draft_message_id = if use_streaming {
         if let Some(channel) = target_channel.as_ref() {
@@ -2019,6 +2022,15 @@ async fn process_channel_message(
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
         }))
+    } else if let Some(delta_tx) = notify_delta_tx {
+        // Draft mode active: pipe tool-call notifications into the draft as streaming
+        // deltas rather than sending separate messages. The DRAFT_CLEAR_SENTINEL sent
+        // before the final response will clear these lines, keeping one clean message.
+        Some(tokio::spawn(async move {
+            while let Some(text) = notify_rx.recv().await {
+                let _ = delta_tx.send(format!("\n{text}")).await;
+            }
+        }))
     } else {
         Some(tokio::spawn(async move {
             let thread_ts = notify_thread_root;
@@ -2075,19 +2087,24 @@ async fn process_channel_message(
         ) => LlmExecutionResult::Completed(result),
     };
 
+    // Drop observers first to close notify_tx → notify_task drains and drops its
+    // delta_tx clone → draft_updater can finish (all senders gone). This ordering
+    // prevents a deadlock that would occur if draft_updater were awaited while
+    // notify_task still holds a live delta_tx sender.
+    let tools_used = notify_observer_flag.tools_used.load(Ordering::Relaxed);
+    drop(notify_observer);
+    drop(notify_observer_flag);
+    if let Some(handle) = notify_task {
+        let _ = handle.await;
+    }
+
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
 
     // Thread the final reply only if tools were used (multi-message response)
-    if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
+    if tools_used && msg.channel != "cli" {
         msg.thread_ts = followup_thread_id(&msg);
-    }
-    // Drop the notify sender so the forwarder task finishes
-    drop(notify_observer);
-    drop(notify_observer_flag);
-    if let Some(handle) = notify_task {
-        let _ = handle.await;
     }
 
     if let Some(token) = typing_cancellation.as_ref() {
