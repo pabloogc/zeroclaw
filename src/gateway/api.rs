@@ -357,6 +357,65 @@ pub async fn handle_api_cron_delete(
     }
 }
 
+/// GET /api/cron/settings — return cron subsystem settings
+pub async fn handle_api_cron_settings_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    Json(serde_json::json!({
+        "enabled": config.cron.enabled,
+        "catch_up_on_startup": config.cron.catch_up_on_startup,
+        "max_run_history": config.cron.max_run_history,
+    }))
+    .into_response()
+}
+
+/// PATCH /api/cron/settings — update cron subsystem settings
+pub async fn handle_api_cron_settings_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let mut config = state.config.lock().clone();
+
+    if let Some(v) = body.get("enabled").and_then(|v| v.as_bool()) {
+        config.cron.enabled = v;
+    }
+    if let Some(v) = body.get("catch_up_on_startup").and_then(|v| v.as_bool()) {
+        config.cron.catch_up_on_startup = v;
+    }
+    if let Some(v) = body.get("max_run_history").and_then(|v| v.as_u64()) {
+        config.cron.max_run_history = u32::try_from(v).unwrap_or(u32::MAX);
+    }
+
+    if let Err(e) = config.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    *state.config.lock() = config.clone();
+
+    Json(serde_json::json!({
+        "status": "ok",
+        "enabled": config.cron.enabled,
+        "catch_up_on_startup": config.cron.catch_up_on_startup,
+        "max_run_history": config.cron.max_run_history,
+    }))
+    .into_response()
+}
+
 /// GET /api/integrations — list all integrations with status
 pub async fn handle_api_integrations(
     State(state): State<AppState>,
@@ -1074,6 +1133,76 @@ fn hydrate_config_for_save(
     incoming.config_path = current.config_path.clone();
     incoming.workspace_dir = current.workspace_dir.clone();
     incoming
+}
+
+// ── Session API handlers ─────────────────────────────────────────
+
+/// GET /api/sessions — list gateway sessions
+pub async fn handle_api_sessions_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "sessions": [],
+            "message": "Session persistence is disabled"
+        }))
+        .into_response();
+    };
+
+    let all_metadata = backend.list_sessions_with_metadata();
+    let gw_sessions: Vec<serde_json::Value> = all_metadata
+        .into_iter()
+        .filter_map(|meta| {
+            let session_id = meta.key.strip_prefix("gw_")?;
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "created_at": meta.created_at.to_rfc3339(),
+                "last_activity": meta.last_activity.to_rfc3339(),
+                "message_count": meta.message_count,
+            }))
+        })
+        .collect();
+
+    Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
+}
+
+/// DELETE /api/sessions/{id} — delete a gateway session
+pub async fn handle_api_session_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    match backend.delete_session(&session_key) {
+        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

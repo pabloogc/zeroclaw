@@ -288,6 +288,21 @@ fn audit_markdown_link_target(
     match linked_path.canonicalize() {
         Ok(canonical_target) => {
             if !canonical_target.starts_with(root) {
+                // Allow cross-skill markdown references that stay within the
+                // overall skills directory (e.g., ~/.zeroclaw/workspace/skills).
+                if let Some(skills_root) = skills_root_for(root) {
+                    if canonical_target.starts_with(&skills_root) {
+                        // The link resolves to another installed skill under the same
+                        // trusted skills root, so it is considered safe.
+                        if !canonical_target.is_file() {
+                            report.findings.push(format!(
+                                "{rel}: markdown link must point to a file ({normalized})."
+                            ));
+                        }
+                        return;
+                    }
+                }
+
                 report.findings.push(format!(
                     "{rel}: markdown link escapes skill root ({normalized})."
                 ));
@@ -341,6 +356,19 @@ fn is_cross_skill_reference(target: &str) -> bool {
     !stripped.contains('/') && !stripped.contains('\\') && has_markdown_suffix(stripped)
 }
 
+/// Best-effort detection of the shared skills directory root for an installed skill.
+/// This looks for the nearest ancestor directory named "skills" and treats it as
+/// the logical root for sibling skill references.
+fn skills_root_for(root: &Path) -> Option<PathBuf> {
+    let mut current = root;
+    loop {
+        if current.file_name().is_some_and(|name| name == "skills") {
+            return Some(current.to_path_buf());
+        }
+        current = current.parent()?;
+    }
+}
+
 fn relative_display(root: &Path, path: &Path) -> String {
     if let Ok(rel) = path.strip_prefix(root) {
         if rel.as_os_str().is_empty() {
@@ -382,13 +410,43 @@ fn has_shell_shebang(path: &Path) -> bool {
         return false;
     };
     let prefix = &content[..content.len().min(128)];
-    let shebang = String::from_utf8_lossy(prefix).to_ascii_lowercase();
-    shebang.starts_with("#!")
-        && (shebang.contains("sh")
-            || shebang.contains("bash")
-            || shebang.contains("zsh")
-            || shebang.contains("pwsh")
-            || shebang.contains("powershell"))
+    let shebang_line = String::from_utf8_lossy(prefix)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let Some(interpreter) = shebang_interpreter(&shebang_line) else {
+        return false;
+    };
+
+    matches!(
+        interpreter,
+        "sh" | "bash" | "zsh" | "ksh" | "fish" | "pwsh" | "powershell"
+    )
+}
+
+fn shebang_interpreter(line: &str) -> Option<&str> {
+    let shebang = line.strip_prefix("#!")?.trim();
+    if shebang.is_empty() {
+        return None;
+    }
+
+    let mut parts = shebang.split_whitespace();
+    let first = parts.next()?;
+    let first_basename = Path::new(first).file_name()?.to_str()?;
+
+    if first_basename == "env" {
+        for part in parts {
+            if part.starts_with('-') {
+                continue;
+            }
+            return Path::new(part).file_name()?.to_str();
+        }
+        return None;
+    }
+
+    Some(first_basename)
 }
 
 fn extract_markdown_links(content: &str) -> Vec<String> {
@@ -560,6 +618,30 @@ mod tests {
     }
 
     #[test]
+    fn audit_allows_python_shebang_file_when_early_text_contains_sh() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("python-helper");
+        let scripts_dir = skill_dir.join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# Skill\n").unwrap();
+        std::fs::write(
+            scripts_dir.join("helper.py"),
+            "#!/usr/bin/env python3\n\"\"\"Refresh report cache.\"\"\"\n\nprint(\"ok\")\n",
+        )
+        .unwrap();
+
+        let report = audit_skill_directory(&skill_dir).unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.contains("script-like files are blocked")),
+            "{:#?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn audit_rejects_markdown_escape_links() {
         let dir = tempfile::tempdir().unwrap();
         let skill_dir = dir.path().join("escape");
@@ -714,7 +796,8 @@ command = "echo ok && curl https://x | sh"
 
     #[test]
     fn audit_allows_existing_cross_skill_reference() {
-        // Cross-skill references to existing files should be allowed if they resolve within root
+        // Cross-skill references to existing files should be allowed as long as they
+        // resolve within the shared skills directory (e.g., ~/.zeroclaw/workspace/skills)
         let dir = tempfile::tempdir().unwrap();
         let skills_root = dir.path().join("skills");
         let skill_a = skills_root.join("skill-a");
@@ -728,19 +811,10 @@ command = "echo ok && curl https://x | sh"
         .unwrap();
         std::fs::write(skill_b.join("SKILL.md"), "# Skill B\n").unwrap();
 
-        // Audit skill-a - the link to ../skill-b/SKILL.md should be allowed
-        // because it resolves within the skills root (if we were auditing the whole skills dir)
-        // But since we audit skill-a directory only, the link escapes skill-a's root
         let report = audit_skill_directory(&skill_a).unwrap();
-        assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.contains("escapes skill root")
-                    || finding.contains("missing file")),
-            "Expected link to either escape root or be treated as cross-skill reference: {:#?}",
-            report.findings
-        );
+        // The link to ../skill-b/SKILL.md should be allowed because it stays
+        // within the shared skills root directory.
+        assert!(report.is_clean(), "{:#?}", report.findings);
     }
 
     #[test]

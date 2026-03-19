@@ -41,6 +41,8 @@ pub struct OpenAiCompatibleProvider {
     timeout_secs: u64,
     /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
+    /// Optional reasoning effort for GPT-5/Codex-compatible backends.
+    reasoning_effort: Option<String>,
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
@@ -179,6 +181,7 @@ impl OpenAiCompatibleProvider {
             native_tool_calling: !merge_system_into_user,
             timeout_secs: 120,
             extra_headers: std::collections::HashMap::new(),
+            reasoning_effort: None,
             api_path: None,
         }
     }
@@ -195,6 +198,12 @@ impl OpenAiCompatibleProvider {
         headers: std::collections::HashMap<String, String>,
     ) -> Self {
         self.extra_headers = headers;
+        self
+    }
+
+    /// Set reasoning effort for GPT-5/Codex-compatible chat-completions APIs.
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<String>) -> Self {
+        self.reasoning_effort = reasoning_effort;
         self
     }
 
@@ -326,6 +335,23 @@ impl OpenAiCompatibleProvider {
         !path.is_empty() && path != "/"
     }
 
+    fn requires_tool_stream(&self) -> bool {
+        let host_requires_tool_stream = reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+            .is_some_and(|host| host == "api.z.ai" || host.ends_with(".z.ai"));
+
+        host_requires_tool_stream || matches!(self.name.as_str(), "zai" | "z.ai")
+    }
+
+    fn tool_stream_for_tools(&self, has_tools: bool) -> Option<bool> {
+        if has_tools && self.requires_tool_stream() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     /// Build the full URL for responses API, detecting if base_url already includes the path.
     fn responses_url(&self) -> String {
         if self.path_ends_with("/responses") {
@@ -363,6 +389,14 @@ impl OpenAiCompatibleProvider {
             })
             .collect()
     }
+
+    fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
+        let id = model.rsplit('/').next().unwrap_or(model);
+        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
+        supports_reasoning_effort
+            .then(|| self.reasoning_effort.clone())
+            .flatten()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -372,6 +406,10 @@ struct ApiChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -568,6 +606,10 @@ struct NativeChatRequest {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1181,6 +1223,8 @@ impl OpenAiCompatibleProvider {
             "does not support tools",
             "function calling is not supported",
             "tool_choice",
+            "tool call validation failed",
+            "was not in request",
         ]
         .iter()
         .any(|hint| lower.contains(hint))
@@ -1193,6 +1237,7 @@ impl Provider for OpenAiCompatibleProvider {
         crate::providers::traits::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
             vision: self.supports_vision,
+            prompt_caching: false,
         }
     }
 
@@ -1239,6 +1284,8 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -1361,6 +1408,8 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -1471,6 +1520,8 @@ impl Provider for OpenAiCompatibleProvider {
             messages: api_messages,
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
             tools: if tools.is_empty() {
                 None
             } else {
@@ -1514,6 +1565,7 @@ impl Provider for OpenAiCompatibleProvider {
         let usage = chat_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let choice = chat_response
             .choices
@@ -1575,6 +1627,9 @@ impl Provider for OpenAiCompatibleProvider {
             ),
             temperature,
             stream: Some(false),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: self
+                .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -1657,6 +1712,7 @@ impl Provider for OpenAiCompatibleProvider {
         let usage = native_response.usage.map(|u| TokenUsage {
             input_tokens: u.prompt_tokens,
             output_tokens: u.completion_tokens,
+            cached_input_tokens: None,
         });
         let message = native_response
             .choices
@@ -1717,6 +1773,8 @@ impl Provider for OpenAiCompatibleProvider {
             messages,
             temperature,
             stream: Some(options.enabled),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -1858,6 +1916,8 @@ mod tests {
             ],
             temperature: 0.4,
             stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: None,
             tools: None,
             tool_choice: None,
         };
@@ -2416,6 +2476,14 @@ mod tests {
     }
 
     #[test]
+    fn native_tool_schema_unsupported_detects_groq_tool_validation_error() {
+        assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall={\"limit\":5}' which was not in request"}}"#
+        ));
+    }
+
+    #[test]
     fn prompt_guided_tool_fallback_injects_system_instruction() {
         let input = vec![ChatMessage::user("check status")];
         let tools = vec![crate::tools::ToolSpec {
@@ -2436,6 +2504,22 @@ mod tests {
         assert_eq!(output[0].role, "system");
         assert!(output[0].content.contains("Available Tools"));
         assert!(output[0].content.contains("shell_exec"));
+    }
+
+    #[test]
+    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
+        let provider = make_provider("test", "https://example.com", None)
+            .with_reasoning_effort(Some("high".to_string()));
+
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            provider.reasoning_effort_for_model("openai/gpt-5"),
+            Some("high".to_string())
+        );
+        assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
     }
 
     #[tokio::test]
@@ -2614,6 +2698,8 @@ mod tests {
             }],
             temperature: 0.7,
             stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
         };
@@ -2621,6 +2707,78 @@ mod tests {
         assert!(json.contains("\"tools\""));
         assert!(json.contains("get_weather"));
         assert!(json.contains("\"tool_choice\":\"auto\""));
+    }
+
+    #[test]
+    fn zai_tool_requests_enable_tool_stream() {
+        let provider = make_provider("zai", "https://api.z.ai/api/paas/v4", None);
+        let req = ApiChatRequest {
+            model: "glm-5".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("List /tmp".to_string()),
+            }],
+            temperature: 0.7,
+            stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: provider.tool_stream_for_tools(true),
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        }
+                    }
+                }
+            })]),
+            tool_choice: Some("auto".to_string()),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"tool_stream\":true"));
+    }
+
+    #[test]
+    fn non_zai_tool_requests_omit_tool_stream() {
+        let provider = make_provider("test", "https://api.example.com/v1", None);
+        let req = ApiChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: MessageContent::Text("List /tmp".to_string()),
+            }],
+            temperature: 0.7,
+            stream: Some(false),
+            reasoning_effort: None,
+            tool_stream: provider.tool_stream_for_tools(true),
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        }
+                    }
+                }
+            })]),
+            tool_choice: Some("auto".to_string()),
+        };
+
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("\"tool_stream\""));
+    }
+
+    #[test]
+    fn z_ai_host_enables_tool_stream_for_custom_profiles() {
+        let provider = make_provider("custom", "https://api.z.ai/api/coding/paas/v4", None);
+        assert_eq!(provider.tool_stream_for_tools(true), Some(true));
     }
 
     #[test]
