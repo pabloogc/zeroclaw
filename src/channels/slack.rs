@@ -337,6 +337,10 @@ impl SlackChannel {
         matches!(channel_id.chars().next(), Some('C' | 'G'))
     }
 
+    fn is_dm_channel_id(channel_id: &str) -> bool {
+        matches!(channel_id.chars().next(), Some('D'))
+    }
+
     fn contains_bot_mention(text: &str, bot_user_id: &str) -> bool {
         if bot_user_id.is_empty() {
             return false;
@@ -2429,7 +2433,9 @@ impl Channel for SlackChannel {
             "text": "…"
         });
         if let Some(ref ts) = message.thread_ts {
-            body["thread_ts"] = serde_json::json!(ts);
+            if !Self::is_dm_channel_id(&message.recipient) {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
         }
         let resp = self
             .http_client()
@@ -2567,7 +2573,9 @@ impl Channel for SlackChannel {
         });
 
         if let Some(ref ts) = message.thread_ts {
-            body["thread_ts"] = serde_json::json!(ts);
+            if !Self::is_dm_channel_id(&message.recipient) {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
         }
 
         let resp = self
