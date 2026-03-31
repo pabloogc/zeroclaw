@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+const SHELL_TIMEOUT_SECS: u64 = 1800;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn shell_timeout_constant_is_reasonable() {
-        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+        assert_eq!(SHELL_TIMEOUT_SECS, 1800, "shell timeout must be 1800 seconds");
     }
 
     #[test]
