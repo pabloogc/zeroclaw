@@ -134,7 +134,7 @@ impl SlackChannel {
     }
 
     fn outbound_thread_ts<'a>(&self, message: &'a SendMessage) -> Option<&'a str> {
-        if self.thread_replies && !Self::is_dm_channel_id(&message.recipient) {
+        if self.thread_replies {
             message.thread_ts.as_deref()
         } else {
             None
@@ -2449,9 +2449,7 @@ impl Channel for SlackChannel {
             "text": "…"
         });
         if let Some(ref ts) = message.thread_ts {
-            if !Self::is_dm_channel_id(&message.recipient) {
-                body["thread_ts"] = serde_json::json!(ts);
-            }
+            body["thread_ts"] = serde_json::json!(ts);
         }
         let resp = self
             .http_client()
