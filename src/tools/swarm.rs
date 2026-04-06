@@ -1,8 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{DelegateAgentConfig, SwarmConfig, SwarmStrategy};
 use crate::providers::{self, Provider};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -568,6 +568,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
+                memory_namespace: None,
             },
         );
         agents.insert(
@@ -584,6 +586,8 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
+                memory_namespace: None,
             },
         );
         agents
@@ -839,11 +843,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only mode")
+        );
     }
 
     #[tokio::test]
@@ -864,11 +870,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
     }
 
     #[tokio::test]
